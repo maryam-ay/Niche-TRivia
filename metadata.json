@@ -1,0 +1,6 @@
+{
+  "name": "Niche Trivia Generator",
+  "description": "An interactive trivia game designed to test fans on hyper-specific niche details across any custom category.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
