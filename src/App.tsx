@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { 
   Rocket, 
@@ -40,6 +40,10 @@ export default function App() {
   const [loading, setLoading] = useState(false);
   const [loadingText, setLoadingText] = useState("Filtering surface-level facts...");
   const [error, setError] = useState<{ type: string; message: string; suggestion?: string } | null>(null);
+
+  // Question Queue State for caching & background fetching
+  const [questionQueue, setQuestionQueue] = useState<TriviaQuestion[]>([]);
+  const isFetchingRef = useRef(false);
 
   // Stats State (Persisted in localStorage)
   const [streak, setStreak] = useState(0);
@@ -97,9 +101,58 @@ export default function App() {
     }
   };
 
-  // Fetch a question from our backend proxy
+  // Silently pre-fetch 5 questions in the background
+  const triggerBackgroundFetch = async (targetCategory: string, currentPrevQuestions: string[]) => {
+    if (isFetchingRef.current) return;
+    isFetchingRef.current = true;
+
+    try {
+      const response = await fetch("/api/trivia", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          category: targetCategory,
+          difficulty,
+          previousQuestions: currentPrevQuestions
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("Background fetch failed");
+      }
+
+      const data = await response.json();
+      if (data.error) {
+        // If the background request was refused, silently stop
+        isFetchingRef.current = false;
+        return;
+      }
+
+      if (data.questions && Array.isArray(data.questions) && data.questions.length > 0) {
+        // Append to current cache queue
+        setQuestionQueue(prev => [...prev, ...data.questions]);
+
+        // Add to previous questions list so they don't get repeated
+        const newQuestionTexts = data.questions.map((q: any) => q.question);
+        setPreviousQuestions(prev => {
+          const updated = [...prev];
+          newQuestionTexts.forEach((qText: string) => {
+            if (!updated.includes(qText)) updated.push(qText);
+          });
+          return updated;
+        });
+      }
+    } catch (err) {
+      console.warn("Silent background pre-fetch failed:", err);
+    } finally {
+      isFetchingRef.current = false;
+    }
+  };
+
+  // Initial fetch for a new session (blocks with loading screen)
   const fetchQuestion = async (targetCategory: string, resetPrevious: boolean = false) => {
     setLoading(true);
+    setLoadingText("Generating your trivia...");
     setError(null);
     setSelectedAnswer(null);
 
@@ -122,31 +175,57 @@ export default function App() {
         throw new Error(data.message || "Failed to contact trivia engine");
       }
 
-      if (data.error === "category_too_narrow") {
+      if (data.error === "category_unusable" || data.error === "category_too_narrow") {
         setError({
-          type: "category_too_narrow",
-          message: `The topic "${targetCategory}" is slightly too narrow or obscure to produce verifiable, fair niche facts.`,
+          type: "category_unusable",
+          message: data.reason || `The topic "${targetCategory}" is unusable or too private for verified trivia generation.`,
           suggestion: data.suggestion
         });
         setCurrentQuestion(null);
-      } else {
-        setCurrentQuestion(data);
+        setQuestionQueue([]);
+      } else if (data.questions && Array.isArray(data.questions) && data.questions.length > 0) {
+        const firstQ = data.questions[0];
+        const remaining = data.questions.slice(1);
+        
+        setCurrentQuestion(firstQ);
+        setQuestionQueue(remaining);
         setIsPlaying(true);
         setCategory(targetCategory);
-        // Track unique question to prevent repetition
-        if (!questionsList.includes(data.question)) {
-          setPreviousQuestions([...questionsList, data.question]);
-        }
+
+        // Pre-populate previous questions cache to keep future fetches unique
+        const allFetchedTexts = data.questions.map((q: any) => q.question);
+        setPreviousQuestions(prev => {
+          const updated = resetPrevious ? [] : [...prev];
+          allFetchedTexts.forEach((qText: string) => {
+            if (!updated.includes(qText)) updated.push(qText);
+          });
+          return updated;
+        });
+      } else {
+        throw new Error("No questions returned from API");
       }
     } catch (err: any) {
       setError({
-        type: "api_failure",
-        message: err.message || "An unexpected error occurred while fetching your question."
+        type: "server_error",
+        message: "Hmm, that didn't work. Try again in a sec."
       });
+      setCurrentQuestion(null);
+      setQuestionQueue([]);
     } finally {
       setLoading(false);
     }
   };
+
+  // Automatically show incoming questions when stuck on empty cache loading
+  useEffect(() => {
+    if (loading && loadingText === "Loading next question..." && questionQueue.length > 0) {
+      const nextQ = questionQueue[0];
+      setCurrentQuestion(nextQ);
+      setQuestionQueue(questionQueue.slice(1));
+      setSelectedAnswer(null);
+      setLoading(false);
+    }
+  }, [loading, loadingText, questionQueue]);
 
   const handleStartGame = (selectedCat: string) => {
     if (!selectedCat.trim()) return;
@@ -199,12 +278,37 @@ export default function App() {
   };
 
   const handleNextQuestion = () => {
-    fetchQuestion(category, false);
+    if (questionQueue.length > 0) {
+      const nextQ = questionQueue[0];
+      const nextQueue = questionQueue.slice(1);
+      
+      setCurrentQuestion(nextQ);
+      setQuestionQueue(nextQueue);
+      setSelectedAnswer(null);
+
+      // Trigger silent background pre-fetch when queue drops to 2 or fewer items
+      if (nextQueue.length <= 2) {
+        triggerBackgroundFetch(category, previousQuestions);
+      }
+    } else {
+      // Rare edge case: Queue is completely empty
+      setLoadingText("Loading next question...");
+      setLoading(true);
+
+      // Silently fetch immediately
+      triggerBackgroundFetch(category, previousQuestions);
+
+      // Wait at most 1 second, then dismiss loading spinner if nothing arrived yet
+      setTimeout(() => {
+        setLoading(false);
+      }, 1000);
+    }
   };
 
   const handleQuitToMenu = () => {
     setIsPlaying(false);
     setCurrentQuestion(null);
+    setQuestionQueue([]);
     setSelectedAnswer(null);
     setError(null);
     setStreak(0);
@@ -220,6 +324,7 @@ export default function App() {
       setTotalCorrect(0);
       setSessionHistory([]);
       setPreviousQuestions([]);
+      setQuestionQueue([]);
     }
   };
 
@@ -281,6 +386,7 @@ export default function App() {
                 initial={{ opacity: 0, scale: 0.98 }}
                 animate={{ opacity: 1, scale: 1 }}
                 exit={{ opacity: 0 }}
+                transition={{ duration: 0.15 }}
                 className="flex flex-col items-center text-center max-w-md mx-auto py-12"
               >
                 <div className="relative mb-8">
@@ -292,22 +398,27 @@ export default function App() {
               </motion.div>
             )}
 
-            {/* 2. ERROR / NARROW CATEGORY RESOLUTION */}
+            {/* 2. ERROR / RESOLUTION */}
             {!loading && error && (
               <motion.div
                 key="error-screen"
                 initial={{ opacity: 0, y: 10 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -10 }}
+                transition={{ duration: 0.15 }}
                 className="w-full max-w-xl mx-auto bg-slate-900/40 border border-slate-800 p-8 backdrop-blur-sm"
               >
                 <div className="flex items-center gap-3 text-amber-500 mb-4">
                   <AlertTriangle className="w-5 h-5 flex-shrink-0" />
-                  <h3 className="text-xs font-mono uppercase tracking-widest font-bold">Calibration Limit</h3>
+                  <h3 className="text-xs font-mono uppercase tracking-widest font-bold">
+                    {error.type === "server_error" ? "Connection Transient Issue" : 
+                     error.type === "malformed_json" ? "Parsing Anomaly" : 
+                     "Calibration Limit"}
+                  </h3>
                 </div>
                 
                 <p className="text-slate-400 text-sm mb-6 leading-relaxed font-light">
-                  {error.message} Our verification engine strictly prevents fabricating or guessing trivia when verified sources aren't established.
+                  {error.message}
                 </p>
 
                 {error.suggestion && (
@@ -344,6 +455,7 @@ export default function App() {
                 initial={{ opacity: 0, y: 15 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -15 }}
+                transition={{ duration: 0.15 }}
                 className="w-full max-w-3xl mx-auto flex flex-col"
               >
                 {/* Meta Tag */}
