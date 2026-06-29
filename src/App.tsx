@@ -124,7 +124,7 @@ export default function App() {
 
     const executeFetch = async (): Promise<boolean> => {
       try {
-        const response = await fetch("/api/trivia", {
+        const response = await fetch("/api/generate-questions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
