@@ -65,7 +65,7 @@ CORE RULES:
 7. The payoff explanation: 1-2 sentences. State why correct AND provide an extra rewarding detail that gives context or connection. No "Did you know?!" or exclamation marks.
 8. Tone: confident, dry, a little playful. No exclamation marks. No cheesy greeting text.`;
 
-      const prompt = `Generate exactly 5 distinct, highly-verified, diverse niche trivia questions about the category "${category}" with a difficulty level of "${selectedDifficulty}".
+      const prompt = `Generate exactly 10 distinct, highly-verified, diverse niche trivia questions about the category "${category}" with a difficulty level of "${selectedDifficulty}".
 Ensure the questions are non-overlapping and cover different angles of the category.
 Avoid any of the following previous questions or very similar questions to prevent repetition:
 ${(previousQuestions || []).map((q: string, i: number) => `${i + 1}. "${q}"`).join("\n")}
@@ -89,7 +89,7 @@ Respond with valid JSON matching the schema.`;
           },
           questions: {
             type: Type.ARRAY,
-            description: "An array of exactly 5 distinct, highly-verified, diverse niche trivia questions matching the prompt constraints.",
+            description: "An array of exactly 10 distinct, highly-verified, diverse niche trivia questions matching the prompt constraints.",
             items: {
               type: Type.OBJECT,
               properties: {

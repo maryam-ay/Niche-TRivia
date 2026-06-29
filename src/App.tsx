@@ -17,6 +17,10 @@ import {
   XCircle, 
   AlertTriangle, 
   ArrowRight, 
+  ArrowLeft,
+  ChevronDown,
+  ChevronUp,
+  Share2,
   Search, 
   Home, 
   BookOpen,
@@ -24,26 +28,26 @@ import {
   TrendingUp,
   BrainCircuit
 } from "lucide-react";
-import { TriviaQuestion, GameState, HistoryItem } from "./types";
+import { TriviaQuestion, HistoryItem } from "./types";
 import { PRELOADED_CATEGORIES, DIFFICULTY_DESCRIPTIONS } from "./data";
 
 export default function App() {
-  // Game Setup State
+  // Game Machine States
+  const [gameState, setGameState] = useState<"category-select" | "loading" | "playing" | "results">("category-select");
   const [category, setCategory] = useState("");
   const [difficulty, setDifficulty] = useState<"warm-up" | "fan" | "obsessive" | "scholar">("fan");
   const [customCategory, setCustomCategory] = useState("");
   
-  // Game Play State
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [currentQuestion, setCurrentQuestion] = useState<TriviaQuestion | null>(null);
+  // Quiz states
+  const [questions, setQuestions] = useState<TriviaQuestion[]>([]);
+  const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
+  const [answers, setAnswers] = useState<{ selectedIndex: number; correctIndex: number; isCorrect: boolean }[]>([]);
   const [selectedAnswer, setSelectedAnswer] = useState<number | null>(null);
+
+  // Loading/Error states
   const [loading, setLoading] = useState(false);
   const [loadingText, setLoadingText] = useState("Filtering surface-level facts...");
   const [error, setError] = useState<{ type: string; message: string; suggestion?: string } | null>(null);
-
-  // Question Queue State for caching & background fetching
-  const [questionQueue, setQuestionQueue] = useState<TriviaQuestion[]>([]);
-  const isFetchingRef = useRef(false);
 
   // Stats State (Persisted in localStorage)
   const [streak, setStreak] = useState(0);
@@ -52,6 +56,10 @@ export default function App() {
   const [totalCorrect, setTotalCorrect] = useState(0);
   const [sessionHistory, setSessionHistory] = useState<HistoryItem[]>([]);
   const [previousQuestions, setPreviousQuestions] = useState<string[]>([]);
+
+  // Expandable breakdown item for results screen
+  const [expandedIndex, setExpandedIndex] = useState<number | null>(null);
+  const [copied, setCopied] = useState(false);
 
   // Local Storage Persistence
   useEffect(() => {
@@ -68,7 +76,7 @@ export default function App() {
 
   // Cycling witty loading messages
   useEffect(() => {
-    if (!loading) return;
+    if (gameState !== "loading") return;
     const messages = [
       "Consulting verified niche archives...",
       "Weaving plausible distractions...",
@@ -84,7 +92,7 @@ export default function App() {
       setLoadingText(messages[index]);
     }, 1200);
     return () => clearInterval(interval);
-  }, [loading]);
+  }, [gameState]);
 
   // Helper to map string category icons to Lucide components safely
   const getCategoryIcon = (iconName: string) => {
@@ -101,218 +109,191 @@ export default function App() {
     }
   };
 
-  // Silently pre-fetch 5 questions in the background
-  const triggerBackgroundFetch = async (targetCategory: string, currentPrevQuestions: string[]) => {
-    if (isFetchingRef.current) return;
-    isFetchingRef.current = true;
-
-    try {
-      const response = await fetch("/api/trivia", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          category: targetCategory,
-          difficulty,
-          previousQuestions: currentPrevQuestions
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error("Background fetch failed");
-      }
-
-      const data = await response.json();
-      if (data.error) {
-        // If the background request was refused, silently stop
-        isFetchingRef.current = false;
-        return;
-      }
-
-      if (data.questions && Array.isArray(data.questions) && data.questions.length > 0) {
-        // Append to current cache queue
-        setQuestionQueue(prev => [...prev, ...data.questions]);
-
-        // Add to previous questions list so they don't get repeated
-        const newQuestionTexts = data.questions.map((q: any) => q.question);
-        setPreviousQuestions(prev => {
-          const updated = [...prev];
-          newQuestionTexts.forEach((qText: string) => {
-            if (!updated.includes(qText)) updated.push(qText);
-          });
-          return updated;
-        });
-      }
-    } catch (err) {
-      console.warn("Silent background pre-fetch failed:", err);
-    } finally {
-      isFetchingRef.current = false;
-    }
-  };
-
-  // Initial fetch for a new session (blocks with loading screen)
-  const fetchQuestion = async (targetCategory: string, resetPrevious: boolean = false) => {
-    setLoading(true);
+  // Initial fetch for a 10-question round (all upfront, no loading between questions)
+  const fetchQuestions = async (targetCategory: string) => {
+    setGameState("loading");
     setLoadingText("Generating your trivia...");
     setError(null);
+    setAnswers([]);
+    setCurrentQuestionIndex(0);
     setSelectedAnswer(null);
 
-    const questionsList = resetPrevious ? [] : previousQuestions;
+    const delays = [1000, 2000, 4000, 8000];
+    const maxRetries = 4;
+    let attempt = 0;
 
-    try {
-      const response = await fetch("/api/trivia", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          category: targetCategory,
-          difficulty,
-          previousQuestions: questionsList
-        }),
-      });
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.message || "Failed to contact trivia engine");
-      }
-
-      if (data.error === "category_unusable" || data.error === "category_too_narrow") {
-        setError({
-          type: "category_unusable",
-          message: data.reason || `The topic "${targetCategory}" is unusable or too private for verified trivia generation.`,
-          suggestion: data.suggestion
+    const executeFetch = async (): Promise<boolean> => {
+      try {
+        const response = await fetch("/api/trivia", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            category: targetCategory,
+            difficulty,
+            previousQuestions: previousQuestions
+          }),
         });
-        setCurrentQuestion(null);
-        setQuestionQueue([]);
-      } else if (data.questions && Array.isArray(data.questions) && data.questions.length > 0) {
-        const firstQ = data.questions[0];
-        const remaining = data.questions.slice(1);
-        
-        setCurrentQuestion(firstQ);
-        setQuestionQueue(remaining);
-        setIsPlaying(true);
-        setCategory(targetCategory);
 
-        // Pre-populate previous questions cache to keep future fetches unique
-        const allFetchedTexts = data.questions.map((q: any) => q.question);
+        let data;
+        try {
+          data = await response.json();
+        } catch (jsonErr) {
+          throw new Error("malformed_json");
+        }
+
+        if (!response.ok) {
+          throw new Error(data.message || `Server status ${response.status}`);
+        }
+
+        if (data.error === "category_unusable" || data.error === "category_too_narrow") {
+          setError({
+            type: "category_unusable",
+            message: data.reason || `The topic "${targetCategory}" is unusable or too private for verified trivia generation.`,
+            suggestion: data.suggestion
+          });
+          setQuestions([]);
+          setGameState("category-select");
+          return true; // Stop retrying, refusal is expected
+        }
+
+        if (!data.questions || !Array.isArray(data.questions) || data.questions.length === 0) {
+          throw new Error("malformed_json");
+        }
+
+        // Validate each question structure roughly
+        const validQs = data.questions.filter((q: any) => 
+          q && typeof q.question === "string" && Array.isArray(q.options) && q.options.length === 4
+        );
+
+        if (validQs.length === 0) {
+          throw new Error("malformed_json");
+        }
+
+        // Successfully generated 10 questions
+        setQuestions(validQs);
+        setCategory(targetCategory);
+        setGameState("playing");
+
+        // Record the question texts in previousQuestions so we avoid them next time
+        const newTexts = validQs.map((q: any) => q.question);
         setPreviousQuestions(prev => {
-          const updated = resetPrevious ? [] : [...prev];
-          allFetchedTexts.forEach((qText: string) => {
-            if (!updated.includes(qText)) updated.push(qText);
+          const updated = [...prev];
+          newTexts.forEach((text: string) => {
+            if (!updated.includes(text)) {
+              updated.push(text);
+            }
           });
           return updated;
         });
-      } else {
-        throw new Error("No questions returned from API");
-      }
-    } catch (err: any) {
-      setError({
-        type: "server_error",
-        message: "Hmm, that didn't work. Try again in a sec."
-      });
-      setCurrentQuestion(null);
-      setQuestionQueue([]);
-    } finally {
-      setLoading(false);
-    }
-  };
 
-  // Automatically show incoming questions when stuck on empty cache loading
-  useEffect(() => {
-    if (loading && loadingText === "Loading next question..." && questionQueue.length > 0) {
-      const nextQ = questionQueue[0];
-      setCurrentQuestion(nextQ);
-      setQuestionQueue(questionQueue.slice(1));
-      setSelectedAnswer(null);
-      setLoading(false);
-    }
-  }, [loading, loadingText, questionQueue]);
+        return true;
+      } catch (err: any) {
+        if (err.message === "malformed_json") {
+          setLoadingText("Formatting issue, retrying generation...");
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          attempt++;
+        }
+
+        if (attempt < maxRetries) {
+          const delay = delays[attempt] || 1000;
+          attempt++;
+          setLoadingText(`Server busy, retrying... (attempt ${attempt}/${maxRetries})`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+          return await executeFetch();
+        }
+
+        setError({
+          type: "server_error",
+          message: "Hmm, that didn't work. Try again in a sec."
+        });
+        setQuestions([]);
+        setGameState("category-select");
+        return false;
+      }
+    };
+
+    await executeFetch();
+  };
 
   const handleStartGame = (selectedCat: string) => {
     if (!selectedCat.trim()) return;
-    fetchQuestion(selectedCat.trim(), true);
+    fetchQuestions(selectedCat.trim());
   };
 
   const handleSelectAnswer = (optionIdx: number) => {
-    if (selectedAnswer !== null || !currentQuestion) return;
+    if (selectedAnswer !== null || questions.length === 0) return;
     
+    const currentQ = questions[currentQuestionIndex];
+    const isCorrect = optionIdx === currentQ.answer_index;
     setSelectedAnswer(optionIdx);
-    const isCorrect = optionIdx === currentQuestion.answer_index;
+
+    // Save answer
+    const newAnswer = {
+      selectedIndex: optionIdx,
+      correctIndex: currentQ.answer_index,
+      isCorrect
+    };
+    const updatedAnswers = [...answers, newAnswer];
+    setAnswers(updatedAnswers);
 
     // Calculate score & stats
     const nextStreak = isCorrect ? streak + 1 : 0;
     const nextHighStreak = Math.max(highStreak, nextStreak);
-    const nextTotalAnswered = totalAnswered + 1;
-    const nextTotalCorrect = isCorrect ? totalCorrect + 1 : totalCorrect;
-
     setStreak(nextStreak);
     setHighStreak(nextHighStreak);
-    setTotalAnswered(nextTotalAnswered);
-    setTotalCorrect(nextTotalCorrect);
-
-    // Save stats
     localStorage.setItem("niche_trivia_high_streak", nextHighStreak.toString());
-    localStorage.setItem("niche_trivia_total_answered", nextTotalAnswered.toString());
-    localStorage.setItem("niche_trivia_total_correct", nextTotalCorrect.toString());
-
-    // Update Category history state
-    const existingHistoryIdx = sessionHistory.findIndex(h => h.category.toLowerCase() === category.toLowerCase() && h.difficulty === difficulty);
-    let updatedHistory = [...sessionHistory];
-
-    if (existingHistoryIdx > -1) {
-      updatedHistory[existingHistoryIdx].score += isCorrect ? 1 : 0;
-      updatedHistory[existingHistoryIdx].total += 1;
-      updatedHistory[existingHistoryIdx].date = new Date().toLocaleDateString();
-    } else {
-      updatedHistory.unshift({
-        id: Math.random().toString(36).substr(2, 9),
-        category,
-        difficulty,
-        score: isCorrect ? 1 : 0,
-        total: 1,
-        date: new Date().toLocaleDateString()
-      });
-    }
-
-    setSessionHistory(updatedHistory);
-    localStorage.setItem("niche_trivia_history", JSON.stringify(updatedHistory));
   };
 
   const handleNextQuestion = () => {
-    if (questionQueue.length > 0) {
-      const nextQ = questionQueue[0];
-      const nextQueue = questionQueue.slice(1);
-      
-      setCurrentQuestion(nextQ);
-      setQuestionQueue(nextQueue);
-      setSelectedAnswer(null);
-
-      // Trigger silent background pre-fetch when queue drops to 2 or fewer items
-      if (nextQueue.length <= 2) {
-        triggerBackgroundFetch(category, previousQuestions);
-      }
+    setSelectedAnswer(null);
+    if (currentQuestionIndex < questions.length - 1) {
+      setCurrentQuestionIndex(currentQuestionIndex + 1);
     } else {
-      // Rare edge case: Queue is completely empty
-      setLoadingText("Loading next question...");
-      setLoading(true);
+      // End of round! Save history and proceed to results
+      const finalScore = answers.filter(a => a.isCorrect).length;
+      const nextTotalAnswered = totalAnswered + questions.length;
+      const nextTotalCorrect = totalCorrect + finalScore;
 
-      // Silently fetch immediately
-      triggerBackgroundFetch(category, previousQuestions);
+      setTotalAnswered(nextTotalAnswered);
+      setTotalCorrect(nextTotalCorrect);
 
-      // Wait at most 1 second, then dismiss loading spinner if nothing arrived yet
-      setTimeout(() => {
-        setLoading(false);
-      }, 1000);
+      localStorage.setItem("niche_trivia_total_answered", nextTotalAnswered.toString());
+      localStorage.setItem("niche_trivia_total_correct", nextTotalCorrect.toString());
+
+      // Save category history
+      const existingHistoryIdx = sessionHistory.findIndex(h => h.category.toLowerCase() === category.toLowerCase() && h.difficulty === difficulty);
+      let updatedHistory = [...sessionHistory];
+
+      if (existingHistoryIdx > -1) {
+        updatedHistory[existingHistoryIdx].score += finalScore;
+        updatedHistory[existingHistoryIdx].total += questions.length;
+        updatedHistory[existingHistoryIdx].date = new Date().toLocaleDateString();
+      } else {
+        updatedHistory.unshift({
+          id: Math.random().toString(36).substring(2, 11),
+          category,
+          difficulty,
+          score: finalScore,
+          total: questions.length,
+          date: new Date().toLocaleDateString()
+        });
+      }
+
+      setSessionHistory(updatedHistory);
+      localStorage.setItem("niche_trivia_history", JSON.stringify(updatedHistory));
+
+      setGameState("results");
     }
   };
 
   const handleQuitToMenu = () => {
-    setIsPlaying(false);
-    setCurrentQuestion(null);
-    setQuestionQueue([]);
+    setGameState("category-select");
+    setQuestions([]);
+    setCurrentQuestionIndex(0);
+    setAnswers([]);
     setSelectedAnswer(null);
     setError(null);
     setStreak(0);
-    setPreviousQuestions([]);
   };
 
   const handleResetStats = () => {
@@ -324,11 +305,96 @@ export default function App() {
       setTotalCorrect(0);
       setSessionHistory([]);
       setPreviousQuestions([]);
-      setQuestionQueue([]);
+      setQuestions([]);
+      setAnswers([]);
+      setGameState("category-select");
     }
   };
 
+  const handleShareResult = () => {
+    const finalScore = answers.filter(a => a.isCorrect).length;
+    const rating = finalScore >= 9 ? "SCHOLAR" :
+                   finalScore >= 7 ? "OBSESSED" :
+                   finalScore >= 5 ? "FAN" :
+                   finalScore >= 3 ? "CASUAL" : "TOURIST";
+    
+    const textSnippet = `I scored ${finalScore}/10 on ${category} trivia. Status: ${rating}.`;
+    navigator.clipboard.writeText(textSnippet).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    });
+  };
+
+  const getVerdict = (score: number) => {
+    if (score >= 9) return { text: "STATUS: SCHOLAR", color: "text-emerald-400 border-emerald-500/30 bg-emerald-500/5" };
+    if (score >= 7) return { text: "STATUS: OBSESSED", color: "text-indigo-400 border-indigo-500/30 bg-indigo-500/5" };
+    if (score >= 5) return { text: "STATUS: FAN", color: "text-amber-400 border-amber-500/30 bg-amber-500/5" };
+    if (score >= 3) return { text: "STATUS: CASUAL", color: "text-slate-400 border-slate-700 bg-slate-900/30" };
+    return { text: "STATUS: TOURIST", color: "text-rose-400 border-rose-500/30 bg-rose-500/5" };
+  };
+
+  // Modern top bar rendering for current rounds
+  const renderProgressBarAndSquares = () => {
+    const currentNum = currentQuestionIndex + 1;
+    return (
+      <div className="flex flex-col gap-2 w-full border-b border-slate-900 pb-3 mb-5">
+        <div className="flex justify-between items-center text-[11px] sm:text-xs font-mono">
+          <span className="text-indigo-400 uppercase tracking-widest font-semibold">
+            QUESTION {String(currentNum).padStart(2, '0')} / 10
+          </span>
+          <span className="text-slate-500 tracking-wider">
+            CALIBRATION: {difficulty.toUpperCase()}
+          </span>
+        </div>
+        
+        {/* Row of 10 small squares/dashes */}
+        <div className="flex flex-wrap items-center gap-1 sm:gap-1.5">
+          {Array.from({ length: 10 }).map((_, idx) => {
+            const isCurrent = idx === currentQuestionIndex;
+            const isAnswered = idx < answers.length;
+            const answerDetails = answers[idx];
+            
+            let squareStyle = "border-slate-800 text-slate-700 bg-transparent";
+            let symbol = "□"; // default empty
+            
+            if (isCurrent) {
+              squareStyle = "border-indigo-500 text-indigo-400 font-bold bg-indigo-500/10";
+              symbol = "▣"; // current item
+            } else if (isAnswered) {
+              if (answerDetails && answerDetails.isCorrect) {
+                squareStyle = "border-emerald-800 text-emerald-400 bg-emerald-500/10";
+                symbol = "■"; // correct
+              } else {
+                squareStyle = "border-rose-950 text-rose-500 bg-rose-500/10";
+                symbol = "■"; // incorrect
+              }
+            }
+            
+            return (
+              <div 
+                key={idx} 
+                className={`w-6 h-6 sm:w-7 sm:h-7 border flex items-center justify-center font-mono text-[10px] sm:text-xs rounded ${squareStyle} transition-all duration-200`}
+                title={`Question ${idx + 1}`}
+              >
+                {symbol}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Dynamic progress bar line */}
+        <div className="h-[2px] bg-slate-900 w-full overflow-hidden rounded-full">
+          <div 
+            className="h-full bg-indigo-500 transition-all duration-300" 
+            style={{ width: `${(currentNum / 10) * 100}%` }}
+          />
+        </div>
+      </div>
+    );
+  };
+
   const accuracyRate = totalAnswered > 0 ? Math.round((totalCorrect / totalAnswered) * 100) : 0;
+  const currentRunningScore = answers.filter(a => a.isCorrect).length;
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 font-sans flex flex-col selection:bg-indigo-500/30 selection:text-indigo-200 relative overflow-hidden">
@@ -340,22 +406,32 @@ export default function App() {
       {/* Header Navigation - Sleek Theme style */}
       <nav className="h-16 border-b border-slate-800 flex items-center justify-between px-6 sm:px-10 bg-slate-900/50 backdrop-blur-sm sticky top-0 z-40">
         <div className="flex items-center gap-4 cursor-pointer" onClick={handleQuitToMenu}>
-          <span className="text-[10px] sm:text-xs font-mono tracking-widest text-slate-500 uppercase">System // Deep Cuts v1.5</span>
+          <span className="text-[10px] sm:text-xs font-mono tracking-widest text-slate-500 uppercase">System // Niche Trivia v1.5</span>
           <div className="h-4 w-[1px] bg-slate-700 hidden sm:block"></div>
-          <h1 className="text-sm sm:text-lg font-medium tracking-tight text-slate-200 uppercase">DEEP CUTS</h1>
+          <h1 className="text-sm sm:text-lg font-medium tracking-tight text-slate-200 uppercase">NICHE TRIVIA</h1>
         </div>
         
-        <div className="flex items-center gap-6">
+        <div className="flex items-center gap-4 sm:gap-6">
+          {gameState !== "category-select" && (
+            <button 
+              onClick={handleQuitToMenu}
+              className="flex items-center gap-2 text-[10px] sm:text-xs font-mono text-slate-400 hover:text-slate-200 transition-colors py-1.5 px-3 border border-slate-800 bg-slate-950/40 rounded hover:border-slate-700"
+            >
+              <ArrowLeft className="w-3.5 h-3.5" />
+              <span>QUIT ROUND</span>
+            </button>
+          )}
+
           <div className="flex flex-col items-end text-right">
-            <span className="text-[9px] uppercase tracking-tighter text-slate-500 font-bold font-mono">Difficulty Calibration</span>
+            <span className="text-[9px] uppercase tracking-tighter text-slate-500 font-bold font-mono">Difficulty</span>
             <span className="text-xs sm:text-sm text-amber-500 font-semibold uppercase tracking-widest font-mono">
-              Level: {difficulty}
+              {difficulty}
             </span>
           </div>
           
-          <div className="w-10 h-10 sm:w-12 sm:h-12 rounded-full border border-slate-800 flex flex-col items-center justify-center bg-slate-900 text-[10px] sm:text-xs font-mono text-slate-300">
-            <span className="text-[9px] text-slate-500">STK</span>
-            <span className="font-bold text-slate-100">{streak}</span>
+          <div className="w-10 h-10 sm:w-12 sm:h-12 rounded border border-slate-800 flex flex-col items-center justify-center bg-slate-900 text-[10px] sm:text-xs font-mono text-slate-300">
+            <span className="text-[9px] text-slate-500 leading-none mb-0.5">STK</span>
+            <span className="font-bold text-slate-100 leading-none">{streak}</span>
           </div>
         </div>
       </nav>
@@ -363,24 +439,26 @@ export default function App() {
       {/* Main Content Layout */}
       <main className="flex-1 flex flex-col md:flex-row relative z-10">
         
-        {/* Sidebar Info (Shown on active gameplay or as left branding detail) */}
-        <aside className="w-full md:w-16 border-b md:border-b-0 md:border-r border-slate-800 flex md:flex-col items-center justify-between md:justify-start py-3 md:py-8 px-6 md:px-0 gap-6 md:gap-12 bg-slate-950/40">
-          <div className="md:[writing-mode:vertical-rl] md:rotate-180 text-[10px] tracking-[0.3em] uppercase text-slate-500 font-bold font-mono">
-            {isPlaying ? category : "KNOWLEDGE VERIFICATION"}
+        {/* Sidebar Info (Left branding detail & score tracker) */}
+        <aside className="w-full md:w-20 border-b md:border-b-0 md:border-r border-slate-800 flex md:flex-col items-center justify-between md:justify-start py-3 md:py-8 px-6 md:px-0 gap-6 md:gap-12 bg-slate-950/40">
+          <div className="md:[writing-mode:vertical-rl] md:rotate-180 text-[10px] tracking-[0.3em] uppercase text-slate-500 font-bold font-mono whitespace-nowrap">
+            {(gameState === "playing" || gameState === "results") ? category : "KNOWLEDGE VERIFICATION"}
           </div>
           <div className="hidden md:block flex-1 w-[1px] bg-slate-800"></div>
-          <div className="text-xs font-mono text-slate-500">
-            {isPlaying ? `${previousQuestions.length} Qs` : "STANDBY"}
+          <div className="text-xs font-mono text-slate-400 font-bold md:[writing-mode:vertical-rl] md:rotate-180 whitespace-nowrap">
+            {(gameState === "playing" || gameState === "results") ? (
+              <span className="text-indigo-400">SCORE: {String(currentRunningScore).padStart(2, '0')} / 10</span>
+            ) : "STANDBY"}
           </div>
         </aside>
 
         {/* Play workspace or Setup container */}
-        <section className="flex-1 flex flex-col p-6 sm:p-12 lg:p-16 justify-center max-w-5xl mx-auto w-full">
+        <section className={`flex-1 flex flex-col justify-center max-w-5xl mx-auto w-full ${gameState === "playing" ? "p-4 sm:p-6 lg:p-8 py-4 sm:py-6" : "p-6 sm:p-12 lg:p-16"}`}>
           
           <AnimatePresence mode="wait">
             
             {/* 1. LOADING STATE */}
-            {loading && (
+            {gameState === "loading" && (
               <motion.div 
                 key="loader"
                 initial={{ opacity: 0, scale: 0.98 }}
@@ -399,7 +477,7 @@ export default function App() {
             )}
 
             {/* 2. ERROR / RESOLUTION */}
-            {!loading && error && (
+            {gameState === "category-select" && error && (
               <motion.div
                 key="error-screen"
                 initial={{ opacity: 0, y: 10 }}
@@ -417,7 +495,7 @@ export default function App() {
                   </h3>
                 </div>
                 
-                <p className="text-slate-400 text-sm mb-6 leading-relaxed font-light">
+                <p className="text-slate-400 text-sm mb-6 leading-relaxed font-light font-mono">
                   {error.message}
                 </p>
 
@@ -428,7 +506,7 @@ export default function App() {
                     <button
                       onClick={() => {
                         setCustomCategory(error.suggestion || "");
-                        fetchQuestion(error.suggestion || "", true);
+                        fetchQuestions(error.suggestion || "");
                       }}
                       className="px-6 py-3 bg-slate-100 text-slate-950 font-mono font-bold text-xs uppercase tracking-widest hover:bg-white transition"
                     >
@@ -442,42 +520,42 @@ export default function App() {
                     onClick={handleQuitToMenu}
                     className="px-6 py-3 border border-slate-800 hover:border-slate-600 text-slate-400 font-mono text-xs uppercase tracking-widest transition"
                   >
-                    Back to Menu
+                    Dismiss Error
                   </button>
                 </div>
               </motion.div>
             )}
 
             {/* 3. ACTIVE PLAY SYSTEM */}
-            {!loading && !error && isPlaying && currentQuestion && (
+            {gameState === "playing" && questions.length > 0 && questions[currentQuestionIndex] && (
               <motion.div
-                key="gameplay"
+                key={`gameplay-${currentQuestionIndex}`}
                 initial={{ opacity: 0, y: 15 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -15 }}
                 transition={{ duration: 0.15 }}
                 className="w-full max-w-3xl mx-auto flex flex-col"
               >
-                {/* Meta Tag */}
-                <div className="flex flex-wrap items-center gap-3 mb-6">
-                  <div className="inline-block px-3 py-1 bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 text-[10px] font-mono uppercase tracking-widest">
-                    {category} // {currentQuestion.fun_fact_tag || "Lesser-Known Fact"}
-                  </div>
-                  <div className="text-[10px] font-mono text-slate-500 tracking-wider">
-                    VERIFICATION NO. {previousQuestions.length}
+                {/* Embedded Progress Tracker */}
+                {renderProgressBarAndSquares()}
+
+                {/* Meta Tag Info */}
+                <div className="flex flex-wrap items-center gap-2 mb-4">
+                  <div className="inline-block px-2.5 py-1 bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 text-[10px] font-mono uppercase tracking-widest">
+                    {category} // {questions[currentQuestionIndex].fun_fact_tag || "Niche Archive"}
                   </div>
                 </div>
 
                 {/* Question Text */}
-                <h2 className="text-2xl sm:text-4xl font-light leading-[1.3] tracking-tight mb-10 text-slate-50">
-                  {currentQuestion.question}
+                <h2 className="text-lg sm:text-2xl font-light leading-snug tracking-tight mb-6 text-slate-50">
+                  {questions[currentQuestionIndex].question}
                 </h2>
 
-                {/* Options Grid (Sleek Theme style with indices) */}
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  {currentQuestion.options.map((option, idx) => {
+                {/* Options Grid */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {questions[currentQuestionIndex].options.map((option, idx) => {
                     const isSelected = selectedAnswer === idx;
-                    const isCorrect = idx === currentQuestion.answer_index;
+                    const isCorrect = idx === questions[currentQuestionIndex].answer_index;
                     const hasAnswered = selectedAnswer !== null;
 
                     let btnStyles = "border-slate-800 bg-slate-900/50 text-slate-300 hover:border-slate-600 hover:bg-slate-900 transition-all";
@@ -485,7 +563,7 @@ export default function App() {
 
                     if (hasAnswered) {
                       if (isCorrect) {
-                        btnStyles = "border-emerald-500 bg-emerald-500/5 text-emerald-400";
+                        btnStyles = "border-emerald-500 bg-emerald-500/5 text-emerald-400 font-medium";
                         labelStyles = "text-emerald-500";
                       } else if (isSelected) {
                         btnStyles = "border-rose-500 bg-rose-500/5 text-rose-400";
@@ -501,77 +579,67 @@ export default function App() {
                         key={idx}
                         disabled={hasAnswered}
                         onClick={() => handleSelectAnswer(idx)}
-                        className={`group flex items-center p-5 sm:p-6 border transition-all text-left w-full relative ${btnStyles}`}
+                        className={`group flex items-center p-3.5 sm:p-4 border transition-all text-left w-full relative ${btnStyles}`}
                       >
-                        <span className={`text-xs font-mono mr-5 transition-colors ${labelStyles}`}>
+                        <span className={`text-xs font-mono mr-4 transition-colors ${labelStyles}`}>
                           0{idx + 1}
                         </span>
-                        <span className="text-sm sm:text-base font-light">{option}</span>
+                        <span className="text-xs sm:text-sm font-light">{option}</span>
                       </button>
                     );
                   })}
                 </div>
 
-                {/* 4. SLEEK PAYOFF EXPANSION (only shown when answered) */}
+                {/* 4. SLEEK PAYOFF EXPANSION */}
                 <AnimatePresence>
                   {selectedAnswer !== null && (
                     <motion.div
-                      initial={{ opacity: 0, y: 15 }}
+                      initial={{ opacity: 0, y: 10 }}
                       animate={{ opacity: 1, y: 0 }}
-                      className="mt-10 border-t border-slate-800 pt-8"
+                      className="mt-5 border-t border-slate-900 pt-5"
                     >
-                      <div className="flex flex-col md:flex-row gap-6 justify-between items-start md:items-center relative bg-slate-900/40 border border-slate-800 p-6 md:p-8 overflow-hidden">
+                      <div className="flex flex-col md:flex-row gap-4 justify-between items-start md:items-center relative bg-slate-900/30 border border-slate-800 p-4 md:p-5 overflow-hidden">
                         
                         {/* Decorative Background Accent */}
                         <div className={`absolute left-0 top-0 h-full w-1.5 ${
-                          selectedAnswer === currentQuestion.answer_index ? "bg-emerald-500" : "bg-rose-500"
+                          selectedAnswer === questions[currentQuestionIndex].answer_index ? "bg-emerald-500" : "bg-rose-500"
                         }`}></div>
 
                         <div className="flex-1 min-w-0">
-                          <div className="text-[10px] font-mono text-slate-500 uppercase tracking-widest mb-2 flex items-center gap-2">
-                            {selectedAnswer === currentQuestion.answer_index ? (
+                          <div className="text-[10px] font-mono text-slate-500 uppercase tracking-widest mb-1.5 flex items-center gap-2">
+                            {selectedAnswer === questions[currentQuestionIndex].answer_index ? (
                               <>
                                 <span className="inline-block w-2 h-2 rounded-full bg-emerald-500"></span>
-                                Correct Verification
+                                Correct Calibration
                               </>
                             ) : (
                               <>
                                 <span className="inline-block w-2 h-2 rounded-full bg-rose-500"></span>
-                                Incorrect Verification
+                                Incorrect Calibration
                               </>
                             )}
                           </div>
                           
-                          <p className="text-sm sm:text-base text-slate-300 font-light italic leading-relaxed">
-                            {currentQuestion.explanation}
+                          <p className="text-xs sm:text-sm text-slate-300 font-light italic leading-relaxed">
+                            {questions[currentQuestionIndex].explanation}
                           </p>
                         </div>
 
                         {/* Action details & Continue */}
-                        <div className="flex items-center gap-6 mt-4 md:mt-0 w-full md:w-auto border-t md:border-t-0 border-slate-800/60 pt-4 md:pt-0">
+                        <div className="flex items-center gap-5 mt-3 md:mt-0 w-full md:w-auto border-t md:border-t-0 border-slate-800/60 pt-3 md:pt-0">
                           <div className="text-left md:text-right">
                             <div className="text-[9px] text-slate-500 uppercase font-bold tracking-widest font-mono">Streak</div>
-                            <div className="text-xl font-mono text-emerald-500">+{streak}</div>
+                            <div className="text-lg font-mono text-emerald-500">+{streak}</div>
                           </div>
 
                           <button
                             onClick={handleNextQuestion}
-                            className="flex-1 md:flex-initial px-6 sm:px-8 py-3 bg-slate-100 text-slate-950 font-bold text-xs tracking-widest uppercase hover:bg-white transition-colors"
+                            className="flex-1 md:flex-initial px-5 py-2.5 bg-slate-100 text-slate-950 font-bold font-mono text-xs tracking-widest uppercase hover:bg-white transition-colors"
                           >
-                            Continue Session
+                            {currentQuestionIndex === questions.length - 1 ? "See Results" : "Next Question →"}
                           </button>
                         </div>
 
-                      </div>
-
-                      {/* Manual Return to Menu option */}
-                      <div className="mt-4 flex justify-end">
-                        <button
-                          onClick={handleQuitToMenu}
-                          className="text-[10px] font-mono text-slate-600 hover:text-slate-400 uppercase tracking-widest transition"
-                        >
-                          Change Topic or Calibration
-                        </button>
                       </div>
 
                     </motion.div>
@@ -581,8 +649,159 @@ export default function App() {
               </motion.div>
             )}
 
-            {/* 5. MENU / SETUP SCREEN */}
-            {!loading && !isPlaying && (
+            {/* 5. RESULTS SCREEN */}
+            {gameState === "results" && questions.length > 0 && (
+              <motion.div
+                key="results"
+                initial={{ opacity: 0, y: 15 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -15 }}
+                transition={{ duration: 0.15 }}
+                className="w-full max-w-3xl mx-auto flex flex-col"
+              >
+                <div className="text-center mb-10">
+                  <span className="text-[10px] font-mono text-indigo-400 tracking-[0.2em] uppercase block mb-2">ROUND CONCLUDED</span>
+                  <h2 className="text-3xl sm:text-4xl font-light text-slate-50 mb-4">Verification Report</h2>
+                  <div className="h-[1px] bg-gradient-to-r from-transparent via-slate-800 to-transparent w-full"></div>
+                </div>
+
+                {/* Big Monospace Score + Verdict */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mb-10">
+                  <div className="bg-slate-900/40 border border-slate-800 p-8 flex flex-col items-center justify-center text-center rounded">
+                    <span className="text-[9px] font-mono text-slate-500 uppercase tracking-widest mb-1">ACCURACY SECURED</span>
+                    <div className="text-5xl sm:text-6xl font-mono font-bold text-indigo-400 tracking-tight">
+                      {String(answers.filter(a => a.isCorrect).length).padStart(2, '0')} <span className="text-slate-600">/</span> 10
+                    </div>
+                    <span className="text-[11px] font-mono text-slate-400 mt-2">
+                      {Math.round((answers.filter(a => a.isCorrect).length / 10) * 100)}% Match Rate
+                    </span>
+                  </div>
+
+                  <div className={`border p-8 flex flex-col items-center justify-center text-center rounded ${getVerdict(answers.filter(a => a.isCorrect).length).color}`}>
+                    <span className="text-[9px] font-mono text-slate-500 uppercase tracking-widest mb-2">CALIBRATION RATING</span>
+                    <div className="text-xl sm:text-2xl font-mono font-bold tracking-wider">
+                      {getVerdict(answers.filter(a => a.isCorrect).length).text}
+                    </div>
+                    <p className="text-xs text-slate-400 mt-3 max-w-xs font-light leading-relaxed">
+                      {answers.filter(a => a.isCorrect).length >= 9 ? "Authoritative, highly comprehensive domain mastery." :
+                       answers.filter(a => a.isCorrect).length >= 7 ? "Deep, obsessive knowledge of minor details." :
+                       answers.filter(a => a.isCorrect).length >= 5 ? "Respectable cultural awareness of this field." :
+                       answers.filter(a => a.isCorrect).length >= 3 ? "Superficial competence. You know the hits, but miss the true deep cuts." :
+                       "Surface tourist. You are merely passing through."}
+                    </p>
+                  </div>
+                </div>
+
+                {/* Question Breakdown Accordion */}
+                <div className="mb-10">
+                  <h3 className="text-[10px] font-mono text-slate-400 tracking-widest uppercase mb-4">ITEMIZED RESPONSE ARCHIVE</h3>
+                  
+                  <div className="border border-slate-800 divide-y divide-slate-900 bg-slate-950/40 rounded overflow-hidden">
+                    {questions.map((q, idx) => {
+                      const ans = answers[idx];
+                      const isCorrect = ans?.isCorrect;
+                      const isExpanded = expandedIndex === idx;
+
+                      return (
+                        <div key={idx} className="transition-colors hover:bg-slate-900/10">
+                          <button
+                            onClick={() => setExpandedIndex(isExpanded ? null : idx)}
+                            className="w-full p-4 sm:p-5 flex items-center justify-between text-left gap-4"
+                          >
+                            <div className="flex items-center gap-3 min-w-0">
+                              <span className={`w-5 h-5 rounded-full flex items-center justify-center font-mono text-[10px] font-bold ${
+                                isCorrect ? "bg-emerald-500/10 border border-emerald-500/20 text-emerald-400" : "bg-rose-500/10 border border-rose-500/20 text-rose-400"
+                              }`}>
+                                {idx + 1}
+                              </span>
+                              <span className="text-sm sm:text-base font-light text-slate-200 truncate pr-4">
+                                {q.question}
+                              </span>
+                            </div>
+                            
+                            <div className="flex items-center gap-2 flex-shrink-0 text-slate-500 font-mono text-xs">
+                              {isCorrect ? (
+                                <span className="text-emerald-400 font-bold">OK</span>
+                              ) : (
+                                <span className="text-rose-400 font-bold">MISS</span>
+                              )}
+                              <ChevronDown className={`w-4 h-4 transition-transform duration-200 ${isExpanded ? "rotate-180 text-indigo-400" : ""}`} />
+                            </div>
+                          </button>
+
+                          <AnimatePresence initial={false}>
+                            {isExpanded && (
+                              <motion.div
+                                initial={{ height: 0, opacity: 0 }}
+                                animate={{ height: "auto", opacity: 1 }}
+                                exit={{ height: 0, opacity: 0 }}
+                                transition={{ duration: 0.15 }}
+                                className="overflow-hidden bg-slate-900/20 border-t border-slate-900/60"
+                              >
+                                <div className="p-5 text-xs sm:text-sm font-light space-y-3">
+                                  <div>
+                                    <span className="font-mono text-[9px] text-slate-500 block uppercase">YOUR ANSWER</span>
+                                    <p className={`font-medium ${isCorrect ? "text-emerald-400" : "text-rose-400"}`}>
+                                      {ans ? q.options[ans.selectedIndex] : "No Answer"}
+                                    </p>
+                                  </div>
+                                  {!isCorrect && (
+                                    <div>
+                                      <span className="font-mono text-[9px] text-slate-500 block uppercase">CORRECT FACT</span>
+                                      <p className="font-medium text-emerald-400">
+                                        {q.options[q.answer_index]}
+                                      </p>
+                                    </div>
+                                  )}
+                                  <div>
+                                    <span className="font-mono text-[9px] text-slate-500 block uppercase">PAYOFF EXPLANATION</span>
+                                    <p className="text-slate-300 italic mt-0.5 leading-relaxed font-light">
+                                      {q.explanation}
+                                    </p>
+                                  </div>
+                                </div>
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Buttons Actions */}
+                <div className="flex flex-col sm:flex-row gap-4 justify-between items-center border-t border-slate-800 pt-8">
+                  {/* Share Score Button */}
+                  <button
+                    onClick={handleShareResult}
+                    className="w-full sm:w-auto px-6 py-3 border border-indigo-500/30 hover:border-indigo-500 bg-indigo-500/5 hover:bg-indigo-500/10 text-indigo-400 font-mono text-xs uppercase tracking-widest transition flex items-center justify-center gap-2"
+                  >
+                    <Share2 className="w-3.5 h-3.5" />
+                    {copied ? "COPIED TO CLIPBOARD!" : "Share Result"}
+                  </button>
+
+                  <div className="flex flex-col sm:flex-row gap-3 w-full sm:w-auto">
+                    <button
+                      onClick={() => {
+                        fetchQuestions(category);
+                      }}
+                      className="w-full sm:w-auto px-6 py-3 border border-slate-800 hover:border-slate-600 text-slate-300 hover:text-white font-mono text-xs uppercase tracking-widest transition"
+                    >
+                      [ PLAY AGAIN ]
+                    </button>
+                    <button
+                      onClick={handleQuitToMenu}
+                      className="w-full sm:w-auto px-6 py-3 bg-slate-100 hover:bg-white text-slate-950 font-mono font-bold text-xs uppercase tracking-widest transition"
+                    >
+                      [ NEW CATEGORY ]
+                    </button>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+
+            {/* 6. MENU / SETUP SCREEN */}
+            {gameState === "category-select" && (
               <motion.div
                 key="setup"
                 initial={{ opacity: 0, y: 10 }}
@@ -649,7 +868,7 @@ export default function App() {
                         {difficulty.replace("-", " ")} Mode Calibration
                       </h4>
                       <p className="text-xs text-slate-500 leading-relaxed font-light">
-                        {DIFFICULTY_DESCRIPTIONS[difficulty].description}
+                        {DIFFICULTY_DESCRIPTIONS[difficulty]?.description}
                       </p>
                     </div>
                   </div>
@@ -660,7 +879,7 @@ export default function App() {
                     onClick={() => handleStartGame(customCategory)}
                     className="w-full py-4 px-6 bg-slate-100 hover:bg-white text-slate-950 font-bold font-mono text-xs tracking-widest uppercase transition disabled:bg-slate-900 disabled:text-slate-700 disabled:cursor-not-allowed"
                   >
-                    Generate Custom Challenge
+                    Generate 10-Question Round
                   </button>
 
                 </div>
