@@ -152,13 +152,7 @@ Respond with valid JSON matching the schema.`;
   };
 
   try {
-    let response;
-    try {
-      response = await queryWithRetry("gemini-2.5-flash");
-    } catch (primaryErr) {
-      console.warn("Primary model gemini-2.5-flash failed after retries, falling back to gemini-2.5-flash-lite...");
-      response = await queryWithRetry("gemini-2.5-flash-lite");
-    }
+    const response = await queryWithRetry("gemini-3.1-flash-lite");
 
     if (!response || !response.text) {
       throw new Error("Received empty response from Gemini API.");
